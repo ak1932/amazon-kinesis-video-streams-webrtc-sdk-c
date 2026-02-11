@@ -536,12 +536,72 @@ STATUS jitterBufferInternalParse(PJitterBuffer pJitterBuffer, BOOL bufferClosed)
                     startDropIndex = index;
                     containStartForEarliestFrame = FALSE;
                 }
-                // are we forcibly clearing out the buffer? if so drop the contents of incomplete frame
+                // are we forcibly clearing out the buffer? parse the range per-frame: deliver frames with valid start, drop only those without
                 else if (pJitterBuffer->headTimestamp < earliestAllowedTimestamp || bufferClosed) {
-                    // do not CHK_STATUS of onFrameDropped because we need to clear the jitter buffer no matter what else happens.
-                    pJitterBuffer->onFrameDroppedFn(pJitterBuffer->customData, startDropIndex, UINT16_DEC(index), pJitterBuffer->headTimestamp);
-                    CHK_STATUS(jitterBufferDropBufferData(pJitterBuffer, startDropIndex, UINT16_DEC(index), curTimestamp));
-                    pJitterBuffer->firstFrameProcessed = TRUE;
+                    UINT16 scanIndex, frameStartSeq, lastSeenSeq, firstPacketSeq;
+                    UINT32 frameTimestamp = 0;
+                    BOOL frameHasStart = FALSE;
+                    BOOL frameHadGap = FALSE; /* if TRUE, we cannot deliver (fill expects contiguous packets) */
+                    UINT32 frameSizeAccum = 0;
+                    UINT32 pktTimestamp;
+                    BOOL pktIsStart = FALSE;
+                    UINT64 scanHashValue = 0;
+                    PRtpPacket pScanPacket = NULL;
+
+                    frameStartSeq = startDropIndex;
+                    firstPacketSeq = 0; /* invalid until we see first packet in frame */
+                    lastSeenSeq = UINT16_DEC(startDropIndex); /* no packet seen yet in range */
+                    for (scanIndex = startDropIndex; scanIndex != index; scanIndex++) {
+                        CHK_STATUS(hashTableContains(pJitterBuffer->pPkgBufferHashTable, scanIndex, &hasEntry));
+                        if (!hasEntry) {
+                            frameHadGap = TRUE; /* gap in current frame: cannot deliver this frame */
+                            continue;            /* skip */
+                        }
+                        CHK_STATUS(hashTableGet(pJitterBuffer->pPkgBufferHashTable, scanIndex, &scanHashValue));
+                        pScanPacket = (PRtpPacket) scanHashValue;
+                        CHK(pScanPacket != NULL, STATUS_NULL_ARG);
+                        pktTimestamp = pScanPacket->header.timestamp;
+                        CHK_STATUS(pJitterBuffer->depayPayloadFn(pScanPacket->payload, pScanPacket->payloadLength, NULL, &partialFrameSize, &pktIsStart));
+                        if (frameTimestamp != 0 && pktTimestamp != frameTimestamp) {
+                            /* new timestamp: close previous frame (frameStartSeq to lastSeenSeq) */
+                            if (frameHasStart && !frameHadGap && firstPacketSeq != 0) {
+                                CHK_STATUS(pJitterBuffer->onFrameReadyFn(pJitterBuffer->customData, firstPacketSeq, lastSeenSeq, frameSizeAccum));
+                                CHK_STATUS(jitterBufferDropBufferData(pJitterBuffer, frameStartSeq, lastSeenSeq, pktTimestamp));
+                            } else {
+                                pJitterBuffer->onFrameDroppedFn(pJitterBuffer->customData, frameStartSeq, lastSeenSeq, frameTimestamp);
+                                CHK_STATUS(jitterBufferDropBufferData(pJitterBuffer, frameStartSeq, lastSeenSeq, pktTimestamp));
+                            }
+                            pJitterBuffer->firstFrameProcessed = TRUE;
+                            frameStartSeq = scanIndex;
+                            frameTimestamp = pktTimestamp;
+                            frameHasStart = pktIsStart;
+                            frameHadGap = FALSE;
+                            firstPacketSeq = scanIndex;
+                            frameSizeAccum = partialFrameSize;
+                        } else {
+                            if (frameTimestamp == 0) {
+                                frameTimestamp = pktTimestamp;
+                                firstPacketSeq = scanIndex;
+                            }
+                            frameHasStart = frameHasStart || pktIsStart;
+                            frameSizeAccum += partialFrameSize;
+                        }
+                        lastSeenSeq = scanIndex;
+                    }
+                    /* last frame in range */
+                    if (frameTimestamp != 0) {
+                        if (frameHasStart && !frameHadGap && firstPacketSeq != 0) {
+                            CHK_STATUS(pJitterBuffer->onFrameReadyFn(pJitterBuffer->customData, firstPacketSeq, lastSeenSeq, frameSizeAccum));
+                            CHK_STATUS(jitterBufferDropBufferData(pJitterBuffer, frameStartSeq, lastSeenSeq, curTimestamp));
+                        } else {
+                            pJitterBuffer->onFrameDroppedFn(pJitterBuffer->customData, frameStartSeq, lastSeenSeq, frameTimestamp);
+                            CHK_STATUS(jitterBufferDropBufferData(pJitterBuffer, frameStartSeq, lastSeenSeq, curTimestamp));
+                        }
+                        pJitterBuffer->firstFrameProcessed = TRUE;
+                    } else {
+                        /* range had only gaps; advance head past [startDropIndex, index-1] */
+                        CHK_STATUS(jitterBufferDropBufferData(pJitterBuffer, startDropIndex, UINT16_DEC(index), curTimestamp));
+                    }
                     isFrameDataContinuous = TRUE;
                     startDropIndex = index;
                 } else {
